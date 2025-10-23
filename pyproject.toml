@@ -7,12 +7,15 @@ requires-python = ">=3.10,<3.14"
 dependencies = [
     "aw-core",
     "aw-client",
+<<<<<<< HEAD
     "ccl-segb",
     "protobuf>=6.33.0",
     "rich>=14.2.0",
     "typer>=0.12",
     "typing-extensions>=4.12.2 ; python_version >= '3.13'",
     "python-dateutil>=2.9.0.post0",
+=======
+>>>>>>> 79fc999 (Migrate from poetry to uv and uv_build, adopting src/ layout)
 ]
 
 [dependency-groups]
@@ -29,7 +32,10 @@ aw-import-screentime = "aw_import_screentime.__main__:main"
 requires = ["uv_build>=0.9.5,<0.10.0"]
 build-backend = "uv_build"
 
+<<<<<<< HEAD
 [tool.uv.sources]
 ccl-segb = { git = "https://github.com/cclgroupltd/ccl-segb.git", rev = "main" }
 
+=======
+>>>>>>> 79fc999 (Migrate from poetry to uv and uv_build, adopting src/ layout)
 
