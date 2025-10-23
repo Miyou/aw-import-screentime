@@ -1,19 +1,26 @@
-[tool.poetry]
+[project]
 name = "aw-import-screentime"
 version = "0.1.0"
 description = ""
-authors = ["Erik Bjäreholt <erik@bjareho.lt>"]
+authors = [{ name = "Erik Bjäreholt", email = "erik@bjareho.lt" }]
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "aw-core",
+    "aw-client",
+]
 
-[tool.poetry.dependencies]
-python = "^3.8"
-aw-core = "*"
-aw-client = "*"
+[dependency-groups]
+dev = [
+    "black",
+    "pytest>=6.2.3,<7",
+    "mypy",
+]
 
-[tool.poetry.dev-dependencies]
-black = "*"
-pytest = "^6.2.3"
-mypy = "*"
+[project.scripts]
+aw-import-screentime = "aw_import_screentime.__main__:main"
 
 [build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["uv_build>=0.9.5,<0.10.0"]
+build-backend = "uv_build"
+
+
