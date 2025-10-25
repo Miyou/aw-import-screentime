@@ -29,7 +29,7 @@ aw-import-screentime --help
 
 ## Access to Screen Time data
 
-Apple stores the data this tool consumes under `~/Library/Biome`. You may need to grant Full Disk Access to your shell so it can read:
+Apple stores the data this tool consumes under `~/Library/Biome`. Make sure your shell/IDE already has Full Disk Access so it can read:
 
 - `~/Library/Biome/sync/sync.db` (device metadata)
 - `~/Library/Biome/streams/restricted/App.InFocus/remote/<device_id>/*`
