@@ -34,7 +34,7 @@ Apple stores the data this tool consumes under `~/Library/Biome`. Make sure your
 - `~/Library/Biome/sync/sync.db` (device metadata)
 - `~/Library/Biome/streams/restricted/App.InFocus/remote/<device_id>/*`
 
-If the directories are empty, unlock Screen Time in System Settings and wait for iCloud to sync the files locally.
+If the directories are empty, unlock Screen Time in System Settings, ensure “Share Across Devices” is enabled on both macOS and iOS, and wait for iCloud to sync the files locally.
 
 ## CLI overview
 
