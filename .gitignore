@@ -1,6 +1,6 @@
-
 # Local
 *.egg-info/
+*.log
 *.py[cod]
 *.pyc
 .DS_Store
