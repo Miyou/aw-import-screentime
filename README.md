@@ -1,17 +1,20 @@
 # aw-import-screentime
 
-Import Apple's Screen Time App.InFocus telemetry (stored in Biome `SEGB` files) into [ActivityWatch](https://activitywatch.net) buckets. All CLI commands emit JSON to stdout so you can easily pipe the results into `jq`, persist them, or feed them to other tools.
+Track your screen usage of your iPhone or iPad in [ActivityWatch](https://activitywatch.net) by continuously importing Apple's [Screen Time](https://support.apple.com/en-us/108806) App.InFocus telemetry into ActivityWatch buckets. Run `aw-import-screentime watch` to stream new focus events as they land on disk; use the other commands when you need previews, backfills, or raw inspection.
+
+![Screenshot of iOS 12 Screen Time](ios12-screen-time_06042018_big.jpg.large_2x.jpg)
 
 ## What you get
 
-- Enumerate Screen Time devices by reading `~/Library/Biome/sync/sync.db`.
-- Decode `App.InFocus` [SEGB files](https://blog.d204n6.com/2022/09/ios-16-breaking-down-biomes-part-4.html) into stitched ActivityWatch events.
-- Preview stitched timelines before importing anything.
-- Push events directly into an ActivityWatch server (testing or production) with per-device buckets.
-- Inspect raw protobuf fields for debugging.
+- A real-time watcher that stitches new App.InFocus events, enriches them, and pushes them straight into ActivityWatch with per-device buckets.
+- Automatic watermark persistence and retry handling so transient ActivityWatch outages do not drop data.
+- On-demand previews and imports for ad-hoc investigations or backfills.
+- Device discovery straight from `~/Library/Biome/sync/sync.db`.
+- Raw protobuf inspection tools for debugging Screen Time data.
 
 ## Requirements
 
+- Enable "Share Across Devices" on both the iOS and macOS device.
 - macOS with Screen Time enabled (the tool reads from `~/Library/Biome/streams/restricted/App.InFocus/remote/…`).
 - Full Disk Access for the terminal/IDE you use to run the CLI.
 - Python 3.10–3.13 and [uv](https://docs.astral.sh/uv).
@@ -20,83 +23,97 @@ Import Apple's Screen Time App.InFocus telemetry (stored in Biome `SEGB` files) 
 ## Installation
 
 ```bash
+git clone https://github.com/ActivityWatch/aw-import-screentime.git
+cd aw-import-screentime
 uv sync
 source .venv/bin/activate
 aw-import-screentime --help
+
 ```
 
 `uv sync` also installs `ccl-segb` from [GitHub](https://github.com/cclgroupltd/ccl-segb), which is required to parse the binary `SEGB` stream Apple stores on disk.
 
-## Access to Screen Time data
+## Quick start
 
-Apple stores the data this tool consumes under `~/Library/Biome`. Make sure your shell/IDE already has Full Disk Access so it can read:
+```bash
+# Stream live Screen Time focus events into ActivityWatch
+aw-import-screentime watch --testing
+```
+
+This launches the long-running watcher: it discovers your devices, keeps per-device watermarks, retries inserts if aw-server is briefly offline, and enriches events with App Store titles. Drop `--testing` to talk to a production server, and consider supervising the command with launchd, systemd, or a tmux session for continuous ingestion.
+
+## Screen Time data locations
+
+Apple stores the data this tool consumes under `~/Library/Biome`. The importer reads:
 
 - `~/Library/Biome/sync/sync.db` (device metadata)
 - `~/Library/Biome/streams/restricted/App.InFocus/remote/<device_id>/*`
-
-If the directories are empty, unlock Screen Time in System Settings, ensure “Share Across Devices” is enabled on both macOS and iOS, and wait for iCloud to sync the files locally.
 
 ## CLI overview
 
 ```bash
 Usage: aw-import-screentime [OPTIONS] COMMAND [ARGS]...
 
+Initialize logging and shared context.
+
 Options:
-  --log-level [ERROR|WARNING|INFO|DEBUG]
-  --tz [local|utc]           Timestamp timezone for stitched events.
-  --config PATH              Reserved for future config support.
-  --version                  Print the CLI version and exit.
-  --help                     Show this message and exit.
+  --log-level        TEXT  ERROR | WARNING | INFO | DEBUG [default: INFO]
+  --tz               TEXT  Timestamp timezone (local or utc) [default: local]
+  --version
+  --help                   Show this message and exit.
 
 Commands:
-  devices
+  devices   List available DevicePeer identifiers (optionally with stream-dir paths).
+  file      Inspect a single SEGB file (raw protobufs or stitched intervals).
+  watch     Purely event-driven watcher: - Uses watchdog to wake on SEGB file changes (create/modify/move). - On each wake, decodes only *new* protobufs (cf watermark per device). - Stitches them into historical ActivityWatch interval events with true timestamps. - Inserts events via insert_events (no heartbeats).
   events
-  file
 ```
 
-All commands emit JSON structures; logs go to stderr via Rich. The `--since` option (available on `events` and `file`) accepts ISO-8601 timestamps or relative values such as `24h`, `7d`, `now-15m`, `yesterday`, or `today`.
+`watch` is the primary command and streams progress via Rich logging; the supporting commands emit JSON so you can pipe their output into `jq` or other tooling. The `--since` option (on `events` subcommands and `file`) accepts ISO-8601 timestamps or natural language such as `24h`, `7d`, `now-15m`, `yesterday`, or `today`.
 
-### `devices`
+### `watch` (primary)
 
-List DevicePeer identifiers discovered in `sync.db`.
+Continuously watch Biome for new SEGB files, stitch them into ActivityWatch intervals, and push them to per-device buckets in real time. Run this command under a supervisor to keep ActivityWatch in sync.
 
 ```bash
-aw-import-screentime devices --paths | jq .
+aw-import-screentime watch --device ABCDEF0123456789
 ```
 
-- `--platform` lets you query a different Apple platform (default `2`, which is iOS).
-- `--paths` includes the resolved stream directory for each device.
+- `--device / -d` filters the devices being watched (omit to include all).
+- `--storefront` mirrors the events commands for title enrichment locales.
+- `--testing/--no-testing` and `--port` control which ActivityWatch server receives events.
+- Maintains per-device watermarks and automatically retries failed inserts after a short delay.
 
-### `events preview`
+### `events`
 
-Dry-run the stitching pipeline for one or more devices. This never contacts ActivityWatch; it is useful for inspecting what would be imported.
+The `events` group provides read-only previews and ActivityWatch imports that share a common set of filters:
+
+- `--device / -d` limits processing to specific device identifiers.
+- `--platform` selects the DevicePeer platform (`2` = iOS).
+- `--limit / -n` controls how many files per device are scanned (`0` = all).
+- `--since` clips stitched intervals to recent activity.
+- `--storefront` supplies App Store locales for title enrichment (defaults to `["us"]`).
+
+#### `events preview`
+
+Dry-run the stitching pipeline without contacting ActivityWatch.
 
 ```bash
-aw-import-screentime events preview \
-  --device ABCDEF0123456789 \
-  --limit 10 \
-  --since 24h \
-  --storefront us --storefront se \
-  | jq .
+aw-import-screentime events preview --device ABCDEF0123456789 --limit 10 --since 24h --storefront us --storefront se | jq .
 ```
 
-- `--limit` controls how many files per device are read (`0` = all).
-- `--since` clips the resulting intervals to recent activity.
-- `--storefront` controls the App Store locales used to enrich bundle titles (defaults to `["us"]`).
+#### `events import`
 
-### `events import`
-
-Run the same decoding logic as `preview`, but stream the events into ActivityWatch. A bucket named `aw-import-screentime_ios_ios-<device_id>` is created per device (append `--bucket-suffix` if you want a custom suffix).
+Run the same decoding logic, but stream the events into ActivityWatch. A bucket named `aw-import-screentime_ios_ios-<device_id>` is created per device (append `--bucket-suffix` for experiments).
 
 ```bash
 # Import the last 24h from every device into an ActivityWatch test server on port 5600
 aw-import-screentime events import --since 24h --limit 20
 ```
 
-- `--testing` switches the `ActivityWatchClient` into testing mode (port `5666`). Use this whenever you are talking to `aw-server --testing`.
-- `--port` overrides the ActivityWatch port explicitly, e.g. `--port 5666` if you prefer to spell it out.
-- `--bucket-suffix` appends a suffix to each bucket name (handy for experiments).
-- `--device`, `--limit`, `--since`, and `--storefront` mirror the `preview` command.
+- `--bucket-suffix` appends a suffix to each bucket name.
+- `--testing` switches the ActivityWatch client into testing mode (port `5666`).
+- `--port` explicitly overrides the ActivityWatch port.
 
 ### `file`
 
@@ -115,12 +132,23 @@ aw-import-screentime file ... --raw --raw-limit 5 | jq .
 - `--max-events` limits how many stitched events are included in the JSON payload (set to `0` for everything).
 - `--since` and `--storefront` behave like the `events` commands.
 
+### `devices`
+
+List DevicePeer identifiers discovered in `sync.db`.
+
+```bash
+aw-import-screentime devices --paths | jq .
+```
+
+- `--platform` lets you query a different Apple platform (default `2`, which is iOS).
+- `--paths` includes the resolved stream directory for each device.
+
 ## Testing with ActivityWatch port 5666
 
 ActivityWatch exposes a dedicated testing port (5666) when you launch `aw-server --testing`. Use one of the following when experimenting against that instance:
 
-- `aw-import-screentime events import --testing ...` (preferred; it switches both the ActivityWatch port and client label).
-- `aw-import-screentime events import --port 5666 ...` (if you want to specify the port manually).
+- `--testing` switches the `ActivityWatchClient` into testing mode (port `5666`). Use this whenever you are talking to `aw-server --testing`.
+- `--port 5666` achieves the same override if you prefer to specify it explicitly.
 
 Both options keep the production data on port 5600 untouched while you verify the importer.
 
@@ -130,3 +158,9 @@ Both options keep the production data on port 5600 untouched while you verify th
 - If Biome has not synced yet, the CLI simply reports empty devices.
 - macOS sometimes logs incomplete foreground durations; intervals are stitched best-effort and may be shorter than what you see in Screen Time.app.
 - App title enrichment depends on live App Store lookups and therefore needs network access the first time a bundle is seen.
+- The watcher retries failed uploads with a 5-second back-off. Persistent failures will keep retrying; check the logs to investigate connectivity issues.
+
+## Troubleshooting
+
+- **The Biome folders are empty.** Unlock Screen Time, enable “Share Across Devices” on both macOS and iOS, then give iCloud a few minutes to sync. You can verify files are present with `ls ~/Library/Biome/streams/restricted/App.InFocus/remote`.
+- **Permission denied when reading Biome.** Confirm your shell or IDE already has Full Disk Access (System Settings → Privacy & Security → Full Disk Access). Restart the terminal after granting access.
