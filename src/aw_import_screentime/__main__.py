@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import sqlite3
+import threading
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from datetime import tzinfo as dt_tzinfo
+from functools import lru_cache
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -16,23 +19,39 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
+    TypeAlias,
     TypedDict,
 )
 
 import ccl_segb
+import dateparser
 import requests
 import typer
 from aw_client import ActivityWatchClient
 from aw_core.models import Event
-from dateutil.parser import isoparse
+from rich import print_json
 from rich.console import Console
 from rich.logging import RichHandler
+
+# File-system watch (watchdog required at install time)
+from watchdog.events import FileSystemEventHandler  # type: ignore
+from watchdog.observers import Observer  # type: ignore
+
+# --------------------------------------------------------------------------------------
+# Aliases
+# --------------------------------------------------------------------------------------
+DeviceId: TypeAlias = str
+BundleId: TypeAlias = str
+Storefront: TypeAlias = str
+Storefronts: TypeAlias = Sequence[Storefront]
+Events: TypeAlias = list[Event]
+Watermarks: TypeAlias = dict[DeviceId, float]
 
 # --------------------------------------------------------------------------------------
 # Version
 # --------------------------------------------------------------------------------------
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 # --------------------------------------------------------------------------------------
 # Types – protobuf typing (safe for type-checkers; runtime imports placed after guard)
@@ -65,92 +84,66 @@ else:
 # Logging & constants
 # --------------------------------------------------------------------------------------
 
+
 logger = logging.getLogger("aw_import_screentime")
 
+
+@dataclass(frozen=True, slots=True)
+class Ctx:
+    tzinfo: dt_tzinfo
+    log_level: int
+
+
+def init_logging(level: str) -> None:
+    lvl = getattr(logging, level.upper(), logging.INFO)
+    if not logger.handlers:
+        handler = RichHandler(
+            rich_tracebacks=True, show_time=False, console=Console(stderr=True)
+        )
+        logger.addHandler(handler)
+        logger.propagate = False
+    logger.setLevel(lvl)
+
+
+# --------------------------------------------------------------------------------------
+# Biome base paths
+# --------------------------------------------------------------------------------------
 APPLE_EPOCH_OFFSET = 978307200  # CFAbsoluteTime offset to Unix epoch (s)
 UTC = timezone.utc
 
+# Biome directories
+BIOME_BASE = Path.home() / "Library" / "Biome"
+STREAMS_DIR = BIOME_BASE / "streams" / "restricted" / "App.InFocus" / "remote"
+
+SYNC_DB_PATH = BIOME_BASE / "sync" / "sync.db"
+# Persisted state (per-device watermarks)
+STATE_DIR = Path.home() / "Library" / "Application Support" / "aw-import-screentime"
+STATE_FILE = STATE_DIR / "state.json"
 # --------------------------------------------------------------------------------------
 # Output helpers
 # --------------------------------------------------------------------------------------
 
 
-def emit_json(obj: Any) -> None:
-    """The *only* function that writes to stdout."""
-    typer.echo(json.dumps(obj))
-
-
-def configure_logging(level_str: str) -> None:
-    """Rich logging to stderr."""
-    level = getattr(logging, level_str.upper(), logging.INFO)
-    handler = RichHandler(
-        rich_tracebacks=True,
-        show_time=False,
-        console=Console(stderr=True),
-    )
-    logging.basicConfig(
-        level=level,
-        format="%(message)s",
-        handlers=[handler],
-        force=True,
-    )
-
-
-def resolve_tz(mode: str) -> dt_tzinfo:
-    """Return UTC or the current local timezone."""
-    if (mode or "").lower() == "utc":
-        return UTC
-    current = datetime.now().astimezone().tzinfo
-    return current or UTC
-
-
-_RELATIVE_SINCE = re.compile(
-    r"^(?:now-)?(?P<num>\d+)(?P<Unit>[smhdSMHD])$"  # 20m, 2h, 7d, 90s, now-15m
-)
-
-
 def parse_since(value: Optional[str], *, tzinfo: dt_tzinfo) -> Optional[datetime]:
     """
-    Parse ISO-8601 or relative times: '20m', '2h', '7d', 'yesterday', 'today', 'now-15m'.
+    Parse ISO-8601 or natural language (dateparser), e.g.:
+    '2 hours ago', 'yesterday', 'today', '2025-10-25T12:00Z'.
     Returns tz-aware datetimes in the provided tzinfo.
     """
     if not value:
         return None
 
-    v = value.strip().lower()
-
-    # Day keywords
-    if v in ("today",):
-        dt = datetime.now(tzinfo).replace(hour=0, minute=0, second=0, microsecond=0)
-        return dt
-    if v in ("yesterday",):
-        dt = datetime.now(tzinfo).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        ) - timedelta(days=1)
-        return dt
-
-    # Relative forms like 20m, 2h, 7d, now-15m
-    m = _RELATIVE_SINCE.match(v)
-    if m:
-        num = int(m.group("num"))
-        unit = m.group("Unit").lower()
-        delta = (
-            timedelta(seconds=num)
-            if unit == "s"
-            else (
-                timedelta(minutes=num)
-                if unit == "m"
-                else timedelta(hours=num) if unit == "h" else timedelta(days=num)
-            )
-        )
-        return datetime.now(tzinfo) - delta
-
-    # Fallback to ISO-8601
-    try:
-        dt = isoparse(value)
-        return dt if dt.tzinfo is not None else dt.replace(tzinfo=tzinfo)
-    except Exception as exc:  # pragma: no cover
-        raise typer.BadParameter(f"Invalid --since value: {value!r}") from exc
+    dt = dateparser.parse(
+        value.strip(),
+        settings={
+            "RELATIVE_BASE": datetime.now(tzinfo),
+            "PREFER_DATES_FROM": "past",
+            "RETURN_AS_TIMEZONE_AWARE": True,
+        },
+    )
+    if not dt:
+        raise typer.BadParameter(f"Invalid --since value: {value!r}")
+    return dt.astimezone(tzinfo)
 
 
 # --------------------------------------------------------------------------------------
@@ -159,7 +152,7 @@ def parse_since(value: Optional[str], *, tzinfo: dt_tzinfo) -> Optional[datetime
 
 
 class EventSink(Protocol):
-    def ensure_bucket(self, device_id: str) -> str: ...
+    def ensure_bucket(self, device_id: DeviceId) -> str: ...
     def emit(self, bucket: str, events: Sequence[Event]) -> int: ...
 
 
@@ -180,12 +173,12 @@ class ActivityWatchSink:
         self.client = client
         self.bucket_suffix = bucket_suffix
 
-    def _bucket_id(self, device_id: str) -> str:
+    def _bucket_id(self, device_id: DeviceId) -> str:
         hostname = f"ios-{device_id}"
         base = f"aw-import-screentime_ios_{hostname}"
         return f"{base}_{self.bucket_suffix}" if self.bucket_suffix else base
 
-    def ensure_bucket(self, device_id: str) -> str:
+    def ensure_bucket(self, device_id: DeviceId) -> str:
         bucket_id = self._bucket_id(device_id)
         hostname = f"ios-{device_id}"
         self.client.client_hostname = hostname
@@ -214,66 +207,33 @@ class ActivityWatchSink:
         return len(events)
 
 
-class NullSink:
-    """No-op sink for preview flows (never prints)."""
-
-    def ensure_bucket(self, device_id: str) -> str:
-        return f"dry-run://ios-{device_id}"
-
-    def emit(self, bucket: str, events: Sequence[Event]) -> int:
-        return len(events)
-
-
 # --------------------------------------------------------------------------------------
 # SQLite helpers (Biome sync.db) & filesystem enumeration
 # --------------------------------------------------------------------------------------
 
 
-def connect_readonly(db_file: Path) -> sqlite3.Connection:
-    """Open SQLite in read-only mode and hint immutability."""
-    uri = f"file:{db_file.as_posix()}?mode=ro&immutable=1"
-    return sqlite3.connect(uri, uri=True)
-
-
-def sync_db_path() -> Path:
-    """Biome sync DB."""
-    return Path.home() / "Library" / "Biome" / "sync" / "sync.db"
-
-
-def get_device_ids(db_path: Path, platform: int = 2) -> list[str]:
+def get_device_ids(db_path: Path, platform: int = 2) -> list[DeviceId]:
     """Return device_identifiers from DevicePeer for a given Apple platform (2=iOS)."""
     if not db_path.exists():
         logger.warning("Sync DB not found at %s", db_path)
         return []
-    with connect_readonly(db_path) as conn:
-        conn.row_factory = lambda cur, row: row[0]
+    uri = f"file:{db_path.as_posix()}?mode=ro&immutable=1"
+    with sqlite3.connect(uri, uri=True) as conn:
+        conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT DISTINCT device_identifier FROM DevicePeer WHERE platform = ?;",
+            "SELECT DISTINCT device_identifier AS device_id FROM DevicePeer WHERE platform = ?;",
             (platform,),
         ).fetchall()
-        logger.info("Found %d device(s) for platform %s", len(rows), platform)
-        return list(rows)
+        devices = [row["device_id"] for row in rows]
+        logger.info("Found %d device(s) for platform %s", len(devices), platform)
+        return devices
 
 
-def device_stream_dir(device_id: str) -> Path:
-    """Biome App.InFocus stream directory for a device id."""
-    return (
-        Path.home()
-        / "Library"
-        / "Biome"
-        / "streams"
-        / "restricted"
-        / "App.InFocus"
-        / "remote"
-        / device_id
-    )
-
-
-def iter_device_files(device_id: str) -> Iterator[Path]:
+def iter_device_files(device_id: DeviceId) -> Iterator[Path]:
     """
     Yield regular files in the device stream directory, oldest→newest by mtime.
     """
-    base = device_stream_dir(device_id)
+    base = STREAMS_DIR / device_id
     try:
         files = [
             p for p in base.iterdir() if p.is_file() and not p.name.startswith(".")
@@ -286,13 +246,11 @@ def iter_device_files(device_id: str) -> Iterator[Path]:
     return iter(files)
 
 
-def tail_device_files(
-    device_id: str, *, limit: int, since: Optional[datetime]
-) -> list[Path]:
+def tail_device_files(device_id: DeviceId, *, limit: int) -> list[Path]:
     """
     Return the most recent SEGB files for a device, limited by `limit`.
-    Note: do NOT filter by file mtime here. Files can contain recent events even when their mtime
-    is older than --since. We clip by --since at the event level later.
+    Note: we intentionally do NOT filter by mtime here; recent events can reside in older files.
+    Clipping based on time is applied later at the event level (see `clip_events_since`).
     """
     files = list(iter_device_files(device_id))
     if limit > 0:
@@ -301,14 +259,68 @@ def tail_device_files(
 
 
 # --------------------------------------------------------------------------------------
-# SEGB decoding (protobuf payloads)
+# State (persisted watermarks)
 # --------------------------------------------------------------------------------------
 
 
-def cf_to_dt(cf_seconds: float, tzinfo: dt_tzinfo) -> datetime:
-    """Convert CFAbsoluteTime seconds to timezone-aware datetime."""
-    epoch_seconds = cf_seconds + APPLE_EPOCH_OFFSET
-    return datetime.fromtimestamp(epoch_seconds, tz=tzinfo)
+def load_watermarks() -> Watermarks:
+    """Load last seen cf_absolute_time per device from STATE_FILE."""
+    try:
+        with STATE_FILE.open("r") as f:
+            data = json.load(f)
+        raw = data.get("last_cf", {})
+        if isinstance(raw, dict):
+            return {str(k): float(v) for k, v in raw.items()}
+    except Exception:
+        logger.debug("No prior watermark state or failed to read; starting fresh")
+    return {}
+
+
+def save_watermarks(last_cf: Watermarks) -> None:
+    """Persist last seen cf_absolute_time per device to STATE_FILE.
+    Logs a warning only once per process if persistence fails.
+    """
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with STATE_FILE.open("w") as f:
+            json.dump({"last_cf": last_cf}, f)
+    except Exception:
+        if not getattr(save_watermarks, "_warned", False):
+            logger.warning(
+                "Failed to persist watermark state to %s", STATE_FILE, exc_info=True
+            )
+            setattr(save_watermarks, "_warned", True)
+
+
+# Per-device state dataclass for watermarks and tracking
+@dataclass(slots=True)
+class DeviceState:
+    last_file: Optional[Path] = None
+    last_cf: float = float("-inf")
+    last_advance_wall: float = 0.0
+
+
+# Consolidated per-device runtime view for the watcher
+@dataclass(slots=True)
+class DeviceRuntime:
+    device_id: DeviceId
+    # ActivityWatch bucket id for this device (set once ensure_bucket succeeds)
+    bucket_id: Optional[str] = None
+    # Low-level SEGB watermarks and bookkeeping
+    state: DeviceState = field(default_factory=DeviceState)
+
+
+@dataclass(slots=True)
+class NewEvents:
+    events: list[AppInFocusEventT]
+    new_last_file: Optional[Path]
+    new_last_cf: Optional[float]
+    dirty: bool
+
+
+# --------------------------------------------------------------------------------------
+# SEGB decoding (protobuf payloads)
+# --------------------------------------------------------------------------------------
 
 
 def iter_app_in_focus_events(file_path: Path) -> Iterator[AppInFocusEventT]:
@@ -339,16 +351,37 @@ def iter_app_in_focus_events(file_path: Path) -> Iterator[AppInFocusEventT]:
 # Title enrichment (iTunes Search API)
 # --------------------------------------------------------------------------------------
 
-# Per-run caches
-_BUNDLE_TITLE_POS: dict[str, str] = {}  # bundle_id -> title
-_BUNDLE_TITLE_NEG: set[tuple[str, str]] = set()  # (bundle_id, storefront)
+# Per-run caches (per-storefront titles) — bounded via LRU for HTTP calls
+TitleCache: TypeAlias = dict[BundleId, dict[Storefront, str]]
+_BUNDLE_TITLE_POS: TitleCache = {}  # bundle_id -> {storefront: title}
+
+# --- iTunes API helpers and LRU cache ---
+
+_session = requests.Session()
+
+
+@lru_cache(maxsize=4096)
+def _itunes_lookup(bundle_id: str, country: str) -> Optional[str]:
+    resp = _session.get(
+        "https://itunes.apple.com/lookup",
+        params={"bundleId": bundle_id, "country": country},
+        timeout=2.0,
+    )
+    # Treat typical transient statuses as retryable (do not cache as negative)
+    if resp.status_code in (429, 500, 502, 503, 504):
+        raise RuntimeError("transient")
+    resp.raise_for_status()
+    payload = resp.json()
+    if int(payload.get("resultCount", 0) or 0) > 0:
+        first = (payload.get("results") or [{}])[0]
+        return first.get("trackName") or first.get("trackCensoredName")
+    return None
 
 
 def lookup_app_title(
-    bundle_id: str,
+    bundle_id: BundleId,
     *,
-    storefronts: Sequence[str],
-    timeout: float = 5.0,
+    storefronts: Storefronts,
 ) -> Optional[str]:
     """
     Resolve a human-friendly app title from an iOS bundle identifier using the iTunes Search API,
@@ -357,46 +390,47 @@ def lookup_app_title(
     if not bundle_id:
         return None
 
-    cached = _BUNDLE_TITLE_POS.get(bundle_id)
-    if cached is not None:
-        return cached
+    cached_map = _BUNDLE_TITLE_POS.get(bundle_id)
+    if cached_map:
+        for c in (cc.strip().lower() for cc in storefronts if cc and cc.strip()):
+            title = cached_map.get(c)
+            if title:
+                return title
+        for title in cached_map.values():
+            return title
 
     for c in (cc.strip().lower() for cc in storefronts if cc and cc.strip()):
         if len(c) != 2 or not c.isalpha():
             logger.debug("Skipping invalid storefront code: %r", c)
             continue
-        if (bundle_id, c) in _BUNDLE_TITLE_NEG:
-            continue
         try:
-            resp = requests.get(
-                "https://itunes.apple.com/lookup",
-                params={"bundleId": bundle_id, "country": c},
-                timeout=timeout,
-            )
-            resp.raise_for_status()
-            payload = resp.json()
-            if int(payload.get("resultCount", 0) or 0) > 0:
-                first = (payload.get("results") or [{}])[0]
-                title = first.get("trackName") or first.get("trackCensoredName")
-                if title:
-                    _BUNDLE_TITLE_POS[bundle_id] = title
-                    logger.debug("Resolved: %s (%s) → %s", bundle_id, c, title)
-                    return title
-            _BUNDLE_TITLE_NEG.add((bundle_id, c))
-        except Exception as exc:
-            _BUNDLE_TITLE_NEG.add((bundle_id, c))
-            logger.debug("iTunes lookup failed: %s in %s: %s", bundle_id, c, exc)
+            title = _itunes_lookup(bundle_id, c)
+        except RuntimeError:
+            # transient error; try next storefront without caching a negative
             continue
+        except requests.RequestException as exc:
+            logger.debug("iTunes lookup network error: %s in %s: %s", bundle_id, c, exc)
+            continue
+        if title:
+            bucket = _BUNDLE_TITLE_POS.get(bundle_id)
+            if bucket is None:
+                bucket = {}
+                _BUNDLE_TITLE_POS[bundle_id] = bucket
+            bucket[c] = title
+            logger.debug("Resolved: %s (%s) → %s", bundle_id, c, title)
+            return title
     return None
 
 
 def enrich_events_with_titles(
     events: Iterable[Event],
     *,
-    storefronts: Sequence[str],
+    storefronts: Storefronts,
 ) -> None:
     """
     Side-effect: add 'title' to event.data where resolvable.
+    Prefers a title matching the first requested storefront with a cached hit; if none,
+    falls back to a default storefront ("us") and finally to any cached title.
     """
     bundles = {
         str(ev.data.get("app"))
@@ -404,7 +438,15 @@ def enrich_events_with_titles(
         if isinstance(ev.data, dict) and ev.data.get("app")
     }
     for b in bundles:
-        if b not in _BUNDLE_TITLE_POS:
+        title_map = _BUNDLE_TITLE_POS.get(b)
+        need_lookup = True
+        if title_map:
+            for cc in (s.strip().lower() for s in storefronts if s and s.strip()):
+                if title_map.get(cc):
+                    need_lookup = False
+                    break
+        if need_lookup:
+            # Best-effort, shorter timeout for hot paths
             lookup_app_title(b, storefronts=storefronts)
     for ev in events:
         if not isinstance(ev.data, dict):
@@ -412,9 +454,24 @@ def enrich_events_with_titles(
         app = ev.data.get("app")
         if not app:
             continue
-        title = _BUNDLE_TITLE_POS.get(str(app))
-        if title:
-            ev.data["title"] = title
+        title_map = _BUNDLE_TITLE_POS.get(str(app))
+        if title_map:
+            # Prefer the first requested storefront with a cached hit
+            chosen: Optional[str] = None
+            for cc in (s.strip().lower() for s in storefronts if s and s.strip()):
+                chosen = title_map.get(cc)
+                if chosen:
+                    break
+            # Fallback to a defined default storefront ("us") if present
+            if not chosen:
+                chosen = title_map.get("us")
+            # Final fallback: any cached title (dicts are insertion-ordered on 3.8+)
+            if not chosen:
+                for v in title_map.values():
+                    chosen = v
+                    break
+            if chosen:
+                ev.data["title"] = chosen
 
 
 # --------------------------------------------------------------------------------------
@@ -439,7 +496,7 @@ def stitch_intervals(
         bundle = getattr(ev, "bundle_id", None)
         if not bundle:
             continue
-        ts = cf_to_dt(ev.cf_absolute_time, tzinfo)
+        ts = datetime.fromtimestamp(ev.cf_absolute_time + APPLE_EPOCH_OFFSET, tz=tzinfo)
         in_foreground = bool(getattr(ev, "in_foreground", False))
 
         # Ignore duplicate "gain focus" on same bundle
@@ -495,7 +552,7 @@ def clip_events_since(events: Iterable[Event], since: datetime) -> Iterator[Even
 # --------------------------------------------------------------------------------------
 
 
-def resolve_storefronts(provided: Optional[Sequence[str]]) -> list[str]:
+def resolve_storefronts(provided: Optional[Sequence[str]]) -> list[Storefront]:
     """
     Resolve storefront list. If none provided, default to ['us'].
     (You can enhance this to infer from locale if desired.)
@@ -504,13 +561,21 @@ def resolve_storefronts(provided: Optional[Sequence[str]]) -> list[str]:
     return cleaned or ["us"]
 
 
+def ensure_and_emit(
+    sink: EventSink, device_id: DeviceId, events: Sequence[Event]
+) -> int:
+    """Interface-driven emit: prepare destination and write events."""
+    bucket = sink.ensure_bucket(device_id)
+    return sink.emit(bucket, events)
+
+
 def build_stitched_events_for_files(
     files: Iterable[Path],
     *,
     tzinfo: dt_tzinfo,
     since: Optional[datetime],
-    storefronts: Sequence[str],
-) -> list[Event]:
+    storefronts: Storefronts,
+) -> Events:
     """Decode → stitch → clip (optional) → enrich; return list of Events."""
     raw_iter = (ev for fp in files for ev in iter_app_in_focus_events(fp))
     stitched_iter = stitch_intervals(raw_iter, tzinfo=tzinfo)
@@ -536,6 +601,13 @@ class RawEventItem(TypedDict):
 # Typer CLI
 # --------------------------------------------------------------------------------------
 
+
+def _version_callback(v: Optional[bool]):
+    if v:
+        typer.echo(__version__)
+        raise typer.Exit()
+
+
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 events_app = typer.Typer(no_args_is_help=True)
 app.add_typer(events_app, name="events")
@@ -548,27 +620,14 @@ def global_opts(
         "INFO", "--log-level", help="ERROR | WARNING | INFO | DEBUG"
     ),
     tz: str = typer.Option("local", "--tz", help="Timestamp timezone (local or utc)"),
-    config: Optional[Path] = typer.Option(
-        None, "--config", help="Optional config file (CLI > ENV > file)"
-    ),
-    version: Optional[bool] = typer.Option(  # pyright: ignore[reportUnusedParameter]
-        None,
-        "--version",
-        callback=lambda v: (typer.echo(__version__) and raise_(typer.Exit())) if v else None,  # type: ignore[misc]
-        help="Show version and exit.",
-        is_eager=True,
+    version: Optional[bool] = typer.Option(
+        None, "--version", callback=_version_callback, is_eager=True
     ),
 ) -> None:
-    """
-    Initialize logging and global context.
-    """
-    configure_logging(log_level)
-    tzinfo = resolve_tz(tz)
-    ctx.obj = {"tzinfo": tzinfo, "config": str(config) if config else None}
-
-
-def raise_(ex: BaseException) -> None:
-    raise ex
+    """Initialize logging and shared context."""
+    init_logging(log_level)
+    tzinfo = UTC if tz.lower() == "utc" else (datetime.now().astimezone().tzinfo or UTC)
+    ctx.obj = {"ctx": Ctx(tzinfo, getattr(logging, log_level.upper(), logging.INFO))}
 
 
 @app.command("devices")
@@ -576,16 +635,13 @@ def cmd_devices(
     platform: int = typer.Option(2, "--platform", help="DevicePeer platform (2=iOS)"),
     paths: bool = typer.Option(False, "--paths", help="Include stream-dir paths"),
 ) -> None:
-    """
-    List available DevicePeer identifiers (optionally with stream-dir paths).
-    """
-    db = sync_db_path()
-    devices = get_device_ids(db, platform=platform)
-    if paths:
-        payload = [{"device_id": d, "path": str(device_stream_dir(d))} for d in devices]
-    else:
-        payload = [{"device_id": d} for d in devices]
-    emit_json(payload)
+    """List available DevicePeer identifiers (optionally with stream-dir paths)."""
+    print_json(
+        data=[
+            {"device_id": d, **({"path": str(STREAMS_DIR / d)} if paths else {})}
+            for d in get_device_ids(SYNC_DB_PATH, platform=platform)
+        ]
+    )
 
 
 @events_app.command("preview")
@@ -600,7 +656,9 @@ def cmd_events_preview(
     platform: int = typer.Option(2, "--platform", help="DevicePeer platform (2=iOS)"),
     limit: int = typer.Option(5, "--limit", "-n", help="Files per device (0 = all)"),
     since: Optional[str] = typer.Option(
-        None, "--since", help="ISO-8601 or relative (e.g., 24h, 2h, yesterday)"
+        None,
+        "--since",
+        help="ISO-8601 or natural language (e.g., '2 hours ago', 'yesterday', '2025-10-25T12:00Z')",
     ),
     storefront: Optional[list[str]] = typer.Option(
         None, "--storefront", help="App Store storefront(s) (repeatable; order matters)"
@@ -609,17 +667,19 @@ def cmd_events_preview(
     """
     Preview stitched events for selected devices (read-only).
     """
-    tzinfo: dt_tzinfo = ctx.obj["tzinfo"]
+    tzinfo: dt_tzinfo = ctx.obj["ctx"].tzinfo
     since_dt = parse_since(since, tzinfo=tzinfo)
     storefronts = resolve_storefronts(storefront)
 
-    db_path = sync_db_path()
-    all_ids = get_device_ids(db_path, platform=platform)
-    chosen = list(all_ids if not device else (d for d in all_ids if d in set(device)))
+    chosen = [
+        d
+        for d in get_device_ids(SYNC_DB_PATH, platform=platform)
+        if not device or d in set(device)
+    ]
 
     results = []
     for dev in chosen:
-        files = tail_device_files(dev, limit=limit, since=since_dt)
+        files = tail_device_files(dev, limit=limit)
         events = build_stitched_events_for_files(
             files, tzinfo=tzinfo, since=since_dt, storefronts=storefronts
         )
@@ -640,7 +700,7 @@ def cmd_events_preview(
             }
         )
 
-    emit_json(results)
+    print_json(data=results)
 
 
 @events_app.command("import")
@@ -655,7 +715,9 @@ def cmd_events_import(
     platform: int = typer.Option(2, "--platform", help="DevicePeer platform (2=iOS)"),
     limit: int = typer.Option(5, "--limit", "-n", help="Files per device (0 = all)"),
     since: Optional[str] = typer.Option(
-        None, "--since", help="ISO-8601 or relative (e.g., 24h, 2h, yesterday)"
+        None,
+        "--since",
+        help="ISO-8601 or natural language (e.g., '2 hours ago', 'yesterday', '2025-10-25T12:00Z')",
     ),
     storefront: Optional[list[str]] = typer.Option(
         None, "--storefront", help="App Store storefront(s) (repeatable; order matters)"
@@ -677,7 +739,7 @@ def cmd_events_import(
     """
     Import stitched events into ActivityWatch.
     """
-    tzinfo: dt_tzinfo = ctx.obj["tzinfo"]
+    tzinfo: dt_tzinfo = ctx.obj["ctx"].tzinfo
     since_dt = parse_since(since, tzinfo=tzinfo)
     storefronts = resolve_storefronts(storefront)
 
@@ -693,20 +755,21 @@ def cmd_events_import(
     except TypeError as exc:
         raise typer.BadParameter(f"ActivityWatchClient init failed: {exc}") from exc
 
-    sink = ActivityWatchSink(client, bucket_suffix=bucket_suffix)
+    sink: EventSink = ActivityWatchSink(client, bucket_suffix=bucket_suffix)
 
-    db_path = sync_db_path()
-    all_ids = get_device_ids(db_path, platform=platform)
-    chosen = list(all_ids if not device else (d for d in all_ids if d in set(device)))
+    chosen = [
+        d
+        for d in get_device_ids(SYNC_DB_PATH, platform=platform)
+        if not device or d in set(device)
+    ]
 
     summaries = []
     for dev in chosen:
-        files = tail_device_files(dev, limit=limit, since=since_dt)
+        files = tail_device_files(dev, limit=limit)
         events = build_stitched_events_for_files(
             files, tzinfo=tzinfo, since=since_dt, storefronts=storefronts
         )
-        bucket_id = sink.ensure_bucket(dev)
-        emitted = sink.emit(bucket_id, events)
+        emitted = ensure_and_emit(sink, dev, events)
         if emitted:
             first_ts = events[0].timestamp
             last_ts = events[-1].timestamp
@@ -723,7 +786,7 @@ def cmd_events_import(
             }
         )
 
-    emit_json(summaries)
+    print_json(data=summaries)
 
 
 @app.command("file")
@@ -740,7 +803,9 @@ def cmd_file(
         20, "--max-events", help="Max stitched events to show"
     ),
     since: Optional[str] = typer.Option(
-        None, "--since", help="ISO-8601 or relative (e.g., 24h, 2h, yesterday)"
+        None,
+        "--since",
+        help="ISO-8601 or natural language (e.g., '2 hours ago', 'yesterday', '2025-10-25T12:00Z')",
     ),
     storefront: Optional[list[str]] = typer.Option(
         None, "--storefront", help="App Store storefront(s) (repeatable; order matters)"
@@ -749,26 +814,23 @@ def cmd_file(
     """
     Inspect a single SEGB file (raw protobufs or stitched intervals).
     """
-    tzinfo: dt_tzinfo = ctx.obj["tzinfo"]
+    tzinfo: dt_tzinfo = ctx.obj["ctx"].tzinfo
     since_dt = parse_since(since, tzinfo=tzinfo)
     storefronts = resolve_storefronts(storefront)
 
     if raw:
         results: list[RawEventItem] = []
-        truncated = False
         for idx, ev in enumerate(iter_app_in_focus_events(file_path)):
             if idx >= raw_limit:
-                truncated = True
                 break
             fields = {
                 fd.name: value for (fd, value) in ev.ListFields()
             }  # only present fields
             results.append({"index": idx, "fields": fields})
-        emit_json(
-            {
+        print_json(
+            data={
                 "file": str(file_path),
                 "mode": "raw",
-                "truncated": truncated,
                 "events": results,
             }
         )
@@ -778,17 +840,14 @@ def cmd_file(
     events = build_stitched_events_for_files(
         [file_path], tzinfo=tzinfo, since=since_dt, storefronts=storefronts
     )
-    truncated = False
     view = events
     if max_events > 0 and len(events) > max_events:
         view = events[:max_events]
-        truncated = True
 
-    emit_json(
-        {
+    print_json(
+        data={
             "file": str(file_path),
             "mode": "stitched",
-            "truncated": truncated,
             "events": [
                 {
                     "timestamp": ev.timestamp.isoformat(),
@@ -801,6 +860,272 @@ def cmd_file(
             ],
         }
     )
+
+
+# --------------------------------------------------------------------------------------
+# Watcher
+# --------------------------------------------------------------------------------------
+
+RETRY_DELAY_SECONDS = 5.0
+
+
+@app.command("watch")
+def cmd_watch(
+    ctx: typer.Context,
+    device: Optional[list[str]] = typer.Option(None, "--device", "-d"),
+    testing: bool = typer.Option(False, "--testing/--no-testing"),
+    port: Optional[int] = typer.Option(None, "--port"),
+    storefront: Optional[list[str]] = typer.Option(None, "--storefront"),
+):
+    """
+    Purely event-driven watcher:
+    - Uses watchdog to wake on SEGB file changes (create/modify/move).
+    - On each wake, decodes only *new* protobufs (cf watermark per device).
+    - Stitches them into historical ActivityWatch interval events with true timestamps.
+    - Inserts events via insert_events (no heartbeats).
+    """
+    tzinfo: dt_tzinfo = ctx.obj["ctx"].tzinfo
+    storefronts = resolve_storefronts(storefront)
+
+    # init AW client (explicit args to satisfy type checker)
+    if port is None:
+        client = ActivityWatchClient("aw-watcher-screentime", testing=testing)
+    else:
+        client = ActivityWatchClient(
+            "aw-watcher-screentime", testing=testing, port=port
+        )
+
+    all_ids = get_device_ids(SYNC_DB_PATH, platform=2)
+    ids = list(all_ids if not device else (d for d in all_ids if d in set(device)))
+
+    wake = threading.Event()
+    changed_lock = threading.Lock()
+    changed: set[str] = set()
+    retry_lock = threading.Lock()
+    scheduled_retries: set[str] = set()
+
+    def schedule_retry(dev: DeviceId, *, delay: float = RETRY_DELAY_SECONDS) -> None:
+        if delay <= 0:
+            logger.debug("[%s] scheduling immediate retry", dev)
+            with changed_lock:
+                changed.add(dev)
+            wake.set()
+            return
+
+        with retry_lock:
+            if dev in scheduled_retries:
+                return
+            scheduled_retries.add(dev)
+        logger.debug("[%s] scheduling retry in %.1fs", dev, delay)
+
+        def _enqueue() -> None:
+            with changed_lock:
+                changed.add(dev)
+            wake.set()
+            with retry_lock:
+                scheduled_retries.discard(dev)
+            logger.debug("[%s] retry wake triggered", dev)
+
+        timer = threading.Timer(delay, _enqueue)
+        timer.daemon = True
+        timer.start()
+
+    class _FSHandler(FileSystemEventHandler):  # type: ignore[misc]
+        def on_any_event(self, event):
+            # Wake the loop on any file change (create/modify/move) for files
+            if getattr(event, "is_directory", False):
+                return
+            # Prefer dest_path for moved events; fall back to src_path
+            p = getattr(event, "dest_path", None) or getattr(event, "src_path", None)
+            if not p:
+                return
+            dev_id = Path(p).parent.name  # .../remote/<device_id>/<file>
+            with changed_lock:
+                changed.add(dev_id)
+            wake.set()
+
+    observer = Observer()  # type: ignore[call-arg]
+    scheduled = 0
+    for dev in ids:
+        path = STREAMS_DIR / dev
+        if not path.exists():
+            logger.debug("[fswatch] path not found for %s: %s", dev, path)
+            continue
+        try:
+            observer.schedule(_FSHandler(), str(path), recursive=False)  # type: ignore[arg-type]
+            scheduled += 1
+            logger.debug("[fswatch] watching %s", path)
+        except Exception as e:
+            logger.error("[fswatch] failed to watch %s: %s", path, e)
+
+    if scheduled == 0:
+        typer.secho(
+            "No device stream directories could be watched. Ensure Screen Time sync is enabled and the App.InFocus paths exist.",
+            fg="red",
+        )
+        raise typer.Exit(1)
+
+    try:
+        observer.start()
+    except Exception as e:
+        logger.error("[fswatch] failed to start observer: %s", e)
+        raise typer.Exit(1)
+
+    logger.info(
+        "Watcher starting: devices=%s testing=%s port=%s",
+        ids,
+        testing,
+        port,
+    )
+
+    # Consolidated per-device runtime objects
+    persisted = load_watermarks()
+    runtimes: dict[DeviceId, DeviceRuntime] = {
+        dev: DeviceRuntime(
+            device_id=dev,
+            state=DeviceState(
+                last_file=None,
+                last_cf=persisted.get(dev, float("-inf")),
+                last_advance_wall=time.monotonic(),
+            ),
+        )
+        for dev in ids
+    }
+
+    logger.debug("state init: runtimes=%s", runtimes)
+
+    sink = ActivityWatchSink(client, bucket_suffix=None)
+    for dev in ids:
+        runtimes[dev].bucket_id = sink.ensure_bucket(dev)
+
+    def read_new_events(dev: DeviceId, state: DeviceState) -> NewEvents:
+        """Return decoded protobufs newer than the watermark without mutating `state`."""
+        # Look at newest 1–2 files; 2 handles rotation without gaps.
+        files = tail_device_files(dev, limit=2)
+        if not files:
+            logger.debug("[%s] no files found", dev)
+            return NewEvents([], None, None, False)
+
+        newest = files[-1]
+        try:
+            newest.stat()
+        except FileNotFoundError:
+            logger.debug("[%s] newest file disappeared: %s", dev, newest)
+            return NewEvents([], None, None, False)
+
+        prev_file = state.last_file
+        prev_file_name: Optional[str] = (
+            prev_file.name if prev_file is not None else None
+        )
+        logger.debug(
+            "[%s] newest=%s last_file=%s last_cf=%.3f",
+            dev,
+            newest.name,
+            prev_file_name,
+            state.last_cf,
+        )
+
+        # If the newest file changed (rotation), scan both; else only newest.
+        candidates = files if state.last_file != newest else [newest]
+
+        new_events: list[AppInFocusEventT] = []
+        try:
+            for fp in candidates:
+                for ev in iter_app_in_focus_events(fp):
+                    cf = getattr(ev, "cf_absolute_time", None)
+                    if cf is None or cf <= state.last_cf:
+                        continue
+                    new_events.append(ev)
+        except Exception as e:
+            logger.debug("[%s] read_new_events(%s) error: %s", dev, newest, e)
+            return NewEvents([], None, None, False)
+
+        if not new_events:
+            logger.debug("[%s] no new events in candidates", dev)
+            return NewEvents([], None, None, False)
+
+        max_cf = max(getattr(e, "cf_absolute_time", state.last_cf) for e in new_events)
+        logger.debug(
+            "[%s] new events=%d; cf watermark: %.3f -> %.3f",
+            dev,
+            len(new_events),
+            state.last_cf,
+            max_cf,
+        )
+        return NewEvents(new_events, newest, max_cf, True)
+
+    # main loop (purely event-driven: no timeout polling)
+    with client:
+        try:
+            while True:
+                # Block until watchdog reports a change
+                wake.wait()
+                wake.clear()
+
+                # Atomically snapshot and drain changed devices
+                with changed_lock:
+                    to_scan = set(changed)
+                    changed.clear()
+
+                if not to_scan:
+                    continue  # spurious wake-ups; loop again
+
+                need_flush = False
+                for dev in to_scan:
+                    state = runtimes[dev].state
+                    res = read_new_events(dev, state)
+
+                    if not res.events:
+                        continue
+
+                    # Ensure chronological order for stitching
+                    res.events.sort(key=lambda e: getattr(e, "cf_absolute_time", 0.0))
+
+                    # Stitch protobuf focus changes into AW interval events
+                    stitched_iter = stitch_intervals(res.events, tzinfo=tzinfo)
+                    events = list(stitched_iter)
+                    if not events:
+                        continue
+
+                    # Optional: enrich with titles
+                    enrich_events_with_titles(events, storefronts=storefronts)
+
+                    bucket_id = runtimes[dev].bucket_id
+                    if not bucket_id:
+                        logger.error("[%s] no bucket_id; skipping insert", dev)
+                        schedule_retry(dev)
+                        continue
+
+                    try:
+                        sink.emit(bucket_id, events)
+                    except requests.RequestException as e:
+                        status = getattr(
+                            getattr(e, "response", None), "status_code", None
+                        )
+                        logger.error(
+                            "[%s] insert_events failed: status=%s error=%s",
+                            dev,
+                            status,
+                            e,
+                        )
+                        schedule_retry(dev)
+                        continue
+
+                    if res.new_last_file is not None:
+                        state.last_file = res.new_last_file
+                    if res.new_last_cf is not None:
+                        state.last_cf = res.new_last_cf
+                    state.last_advance_wall = time.monotonic()
+                    if res.dirty:
+                        need_flush = True
+
+                if need_flush:
+                    save_watermarks({d: rt.state.last_cf for d, rt in runtimes.items()})
+        finally:
+            # Clean shutdown of observer if it was started
+            if observer is not None:
+                observer.stop()
+                observer.join(timeout=5)
 
 
 # --------------------------------------------------------------------------------------
