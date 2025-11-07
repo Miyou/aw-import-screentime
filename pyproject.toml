@@ -13,6 +13,8 @@ dependencies = [
     "typer>=0.12",
     "typing-extensions>=4.12.2 ; python_version >= '3.13'",
     "python-dateutil>=2.9.0.post0",
+    "dateparser>=1.2,<2",
+    "watchdog>=4,<7",
 ]
 
 [dependency-groups]
