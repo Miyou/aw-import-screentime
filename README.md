@@ -57,12 +57,14 @@ Usage: aw-import-screentime [OPTIONS] COMMAND [ARGS]...
 Initialize logging and shared context.
 
 Options:
-  --log-level        TEXT  ERROR | WARNING | INFO | DEBUG [default: INFO]
-  --tz               TEXT  Timestamp timezone (local or utc) [default: local]
+  --log-level        TEXT  ERROR | WARNING | INFO | DEBUG
+  --tz               TEXT  Timestamp timezone (local or utc)
+  --config           PATH  Path to aw-import-screentime TOML config file
   --version
   --help                   Show this message and exit.
 
 Commands:
+  config    Manage aw-import-screentime TOML configuration.
   devices   List available DevicePeer identifiers (optionally with stream-dir paths).
   file      Inspect a single SEGB file (raw protobufs or stitched intervals).
   watch     Purely event-driven watcher: - Uses watchdog to wake on SEGB file changes (create/modify/move). - On each wake, decodes only *new* protobufs (cf watermark per device). - Stitches them into historical ActivityWatch interval events with true timestamps. - Inserts events via insert_events (no heartbeats).
@@ -70,6 +72,27 @@ Commands:
 ```
 
 `watch` is the primary command and streams progress via Rich logging; the supporting commands emit JSON so you can pipe their output into `jq` or other tooling. The `--since` option (on `events` subcommands and `file`) accepts ISO-8601 timestamps or natural language such as `24h`, `7d`, `now-15m`, `yesterday`, or `today`.
+
+By default, configuration is loaded from:
+
+- `~/Library/Application Support/activitywatch/aw-import-screentime/aw-import-screentime.toml`
+
+CLI flags override TOML values when both are provided.
+
+### `config`
+
+Create, inspect, and validate watcher config:
+
+```bash
+# Create starter config
+aw-import-screentime config init
+
+# Show parsed config + effective defaults
+aw-import-screentime config show
+
+# Validate syntax and values
+aw-import-screentime config validate
+```
 
 ### `watch` (primary)
 
@@ -83,6 +106,7 @@ aw-import-screentime watch --device ABCDEF0123456789
 - `--storefront` mirrors the events commands for title enrichment locales.
 - `--testing/--no-testing` and `--port` control which ActivityWatch server receives events.
 - Maintains per-device watermarks and automatically retries failed inserts after a short delay.
+- If omitted, these options can come from `aw-import-screentime.toml`.
 
 ### `events`
 
