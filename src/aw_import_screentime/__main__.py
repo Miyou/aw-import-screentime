@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import shutil
 import threading
 import time
 from dataclasses import dataclass, field
@@ -36,6 +37,11 @@ from rich.logging import RichHandler
 # File-system watch (watchdog required at install time)
 from watchdog.events import FileSystemEventHandler  # type: ignore
 from watchdog.observers import Observer  # type: ignore
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - fallback for Python 3.10
+    import tomli as tomllib  # type: ignore[no-redef, import-not-found]
 
 # --------------------------------------------------------------------------------------
 # Aliases
@@ -70,8 +76,11 @@ if TYPE_CHECKING:
         app_build: str
         platform_flag: int
 
-        def ParseFromString(self, data: bytes) -> None: ...
-        def ListFields(self) -> list[tuple[Any, Any]]: ...
+        def ParseFromString(self, data: bytes) -> None:
+            ...
+
+        def ListFields(self) -> list[tuple[Any, Any]]:
+            ...
 
     AppInFocusEventPb: Any = None
 
@@ -92,6 +101,38 @@ logger = logging.getLogger("aw_import_screentime")
 class Ctx:
     tzinfo: dt_tzinfo
     log_level: int
+    config: "AppConfig"
+    config_path: Path
+    config_error: Optional[str] = None
+
+
+@dataclass(frozen=True, slots=True)
+class WatchDefaults:
+    device: tuple[DeviceId, ...] = ()
+    storefront: tuple[Storefront, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityWatchDefaults:
+    testing: Optional[bool] = None
+    port: Optional[int] = None
+    bucket_suffix: Optional[str] = None
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeDefaults:
+    log_level: Optional[str] = None
+    tz: Optional[str] = None
+    retry_delay_seconds: Optional[float] = None
+
+
+@dataclass(frozen=True, slots=True)
+class AppConfig:
+    path: Path
+    exists: bool = False
+    watch: WatchDefaults = field(default_factory=WatchDefaults)
+    activitywatch: ActivityWatchDefaults = field(default_factory=ActivityWatchDefaults)
+    runtime: RuntimeDefaults = field(default_factory=RuntimeDefaults)
 
 
 def init_logging(level: str) -> None:
@@ -110,14 +151,24 @@ def init_logging(level: str) -> None:
 # --------------------------------------------------------------------------------------
 APPLE_EPOCH_OFFSET = 978307200  # CFAbsoluteTime offset to Unix epoch (s)
 UTC = timezone.utc
+VALID_LOG_LEVELS = {"ERROR", "WARNING", "INFO", "DEBUG"}
+VALID_TZ_CHOICES = {"local", "utc"}
 
 # Biome directories
 BIOME_BASE = Path.home() / "Library" / "Biome"
 STREAMS_DIR = BIOME_BASE / "streams" / "restricted" / "App.InFocus" / "remote"
 
 SYNC_DB_PATH = BIOME_BASE / "sync" / "sync.db"
+# ActivityWatch config/state locations
+AW_APP_SUPPORT = Path.home() / "Library" / "Application Support"
+AW_ACTIVITYWATCH_DIR = AW_APP_SUPPORT / "activitywatch"
+AW_IMPORT_SCREENTIME_DIR = AW_ACTIVITYWATCH_DIR / "aw-import-screentime"
+DEFAULT_CONFIG_PATH = AW_IMPORT_SCREENTIME_DIR / "aw-import-screentime.toml"
+
 # Persisted state (per-device watermarks)
-STATE_DIR = Path.home() / "Library" / "Application Support" / "aw-import-screentime"
+LEGACY_STATE_DIR = AW_APP_SUPPORT / "aw-import-screentime"
+LEGACY_STATE_FILE = LEGACY_STATE_DIR / "state.json"
+STATE_DIR = AW_IMPORT_SCREENTIME_DIR
 STATE_FILE = STATE_DIR / "state.json"
 # --------------------------------------------------------------------------------------
 # Output helpers
@@ -147,13 +198,287 @@ def parse_since(value: Optional[str], *, tzinfo: dt_tzinfo) -> Optional[datetime
 
 
 # --------------------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------------------
+
+
+class ConfigError(ValueError):
+    pass
+
+
+def resolve_config_path(path: Optional[Path]) -> Path:
+    return (path or DEFAULT_CONFIG_PATH).expanduser()
+
+
+def normalize_log_level_name(value: str) -> str:
+    level = value.strip().upper()
+    if level not in VALID_LOG_LEVELS:
+        allowed = ", ".join(sorted(VALID_LOG_LEVELS))
+        raise ConfigError(f"invalid log_level {value!r}; expected one of: {allowed}")
+    return level
+
+
+def normalize_tz_name(value: str) -> str:
+    tz_name = value.strip().lower()
+    if tz_name not in VALID_TZ_CHOICES:
+        allowed = ", ".join(sorted(VALID_TZ_CHOICES))
+        raise ConfigError(f"invalid tz {value!r}; expected one of: {allowed}")
+    return tz_name
+
+
+def _as_table(parent: dict[str, Any], name: str) -> dict[str, Any]:
+    section = parent.get(name, {})
+    if section is None:
+        return {}
+    if not isinstance(section, dict):
+        raise ConfigError(f"[{name}] must be a TOML table")
+    return section
+
+
+def _as_string_list(
+    value: Any,
+    *,
+    field_name: str,
+    lowercase: bool = False,
+) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ConfigError(f"{field_name} must be an array of strings")
+    out: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ConfigError(f"{field_name} must contain only strings")
+        text = item.strip()
+        if not text:
+            continue
+        out.append(text.lower() if lowercase else text)
+    return tuple(out)
+
+
+def _parse_storefronts(value: Any) -> tuple[str, ...]:
+    storefronts = _as_string_list(
+        value,
+        field_name="watch.storefront",
+        lowercase=True,
+    )
+    for storefront in storefronts:
+        if len(storefront) != 2 or not storefront.isalpha():
+            raise ConfigError("watch.storefront entries must be 2-letter country codes")
+    return storefronts
+
+
+def _parse_port(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError("activitywatch.port must be an integer")
+    if value < 1 or value > 65535:
+        raise ConfigError("activitywatch.port must be in range 1..65535")
+    return value
+
+
+def _parse_optional_bool(value: Any, *, field_name: str) -> Optional[bool]:
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ConfigError(f"{field_name} must be true or false")
+    return value
+
+
+def _parse_optional_string(value: Any, *, field_name: str) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ConfigError(f"{field_name} must be a string")
+    text = value.strip()
+    return text if text else None
+
+
+def _parse_retry_delay(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError("runtime.retry_delay_seconds must be numeric")
+    delay = float(value)
+    if delay < 0:
+        raise ConfigError("runtime.retry_delay_seconds must be >= 0")
+    return delay
+
+
+def load_app_config(config_path: Path) -> AppConfig:
+    path = resolve_config_path(config_path)
+    if not path.exists():
+        return AppConfig(path=path, exists=False)
+
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ConfigError(f"failed to parse {path}: {exc}") from exc
+
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path} must contain a TOML table at the root")
+
+    watch_raw = _as_table(raw, "watch")
+    activitywatch_raw = _as_table(raw, "activitywatch")
+    runtime_raw = _as_table(raw, "runtime")
+
+    watch = WatchDefaults(
+        device=_as_string_list(watch_raw.get("device"), field_name="watch.device"),
+        storefront=_parse_storefronts(watch_raw.get("storefront")),
+    )
+    activitywatch = ActivityWatchDefaults(
+        testing=_parse_optional_bool(
+            activitywatch_raw.get("testing"),
+            field_name="activitywatch.testing",
+        ),
+        port=_parse_port(activitywatch_raw.get("port")),
+        bucket_suffix=_parse_optional_string(
+            activitywatch_raw.get("bucket_suffix"),
+            field_name="activitywatch.bucket_suffix",
+        ),
+    )
+    runtime = RuntimeDefaults(
+        log_level=(
+            normalize_log_level_name(runtime_raw["log_level"])
+            if "log_level" in runtime_raw and runtime_raw["log_level"] is not None
+            else None
+        ),
+        tz=(
+            normalize_tz_name(runtime_raw["tz"])
+            if "tz" in runtime_raw and runtime_raw["tz"] is not None
+            else None
+        ),
+        retry_delay_seconds=_parse_retry_delay(runtime_raw.get("retry_delay_seconds")),
+    )
+    return AppConfig(
+        path=path,
+        exists=True,
+        watch=watch,
+        activitywatch=activitywatch,
+        runtime=runtime,
+    )
+
+
+def config_to_dict(config: AppConfig) -> dict[str, Any]:
+    return {
+        "watch": {
+            "device": list(config.watch.device),
+            "storefront": list(config.watch.storefront),
+        },
+        "activitywatch": {
+            "testing": config.activitywatch.testing,
+            "port": config.activitywatch.port,
+            "bucket_suffix": config.activitywatch.bucket_suffix,
+        },
+        "runtime": {
+            "log_level": config.runtime.log_level,
+            "tz": config.runtime.tz,
+            "retry_delay_seconds": config.runtime.retry_delay_seconds,
+        },
+    }
+
+
+def render_default_config() -> str:
+    return """# aw-import-screentime configuration
+# Save this file at:
+#   ~/Library/Application Support/activitywatch/aw-import-screentime/aw-import-screentime.toml
+#
+# CLI flags override values in this file.
+
+[watch]
+# device = ["5450A312-AF19-47F7-B5E2-2CE11F81B321"]
+storefront = ["us"]
+
+[activitywatch]
+# testing = false
+# port = 5600
+# bucket_suffix = "my-experiment"
+
+[runtime]
+# log_level = "INFO"
+# tz = "local"  # local | utc
+# retry_delay_seconds = 5.0
+"""
+
+
+def resolve_device_filter(
+    cli_devices: Optional[Sequence[str]],
+    config_devices: Sequence[str],
+) -> Optional[list[str]]:
+    if cli_devices is not None:
+        cleaned = [d.strip() for d in cli_devices if d and d.strip()]
+        return cleaned or None
+    if config_devices:
+        return list(config_devices)
+    return None
+
+
+def resolve_storefront_inputs(
+    cli_storefronts: Optional[Sequence[str]],
+    config_storefronts: Sequence[str],
+) -> list[Storefront]:
+    source: Optional[Sequence[str]]
+    if cli_storefronts is not None:
+        source = cli_storefronts
+    elif config_storefronts:
+        source = config_storefronts
+    else:
+        source = None
+    return resolve_storefronts(source)
+
+
+def resolve_testing_flag(cli_testing: Optional[bool], config: AppConfig) -> bool:
+    if cli_testing is not None:
+        return cli_testing
+    if config.activitywatch.testing is not None:
+        return config.activitywatch.testing
+    return False
+
+
+def resolve_aw_port(cli_port: Optional[int], config: AppConfig) -> Optional[int]:
+    if cli_port is not None:
+        return cli_port
+    return config.activitywatch.port
+
+
+def resolve_bucket_suffix(
+    cli_bucket_suffix: Optional[str],
+    config: AppConfig,
+) -> Optional[str]:
+    if cli_bucket_suffix is not None:
+        text = cli_bucket_suffix.strip()
+        return text if text else None
+    return config.activitywatch.bucket_suffix
+
+
+def _migrate_legacy_state_file() -> None:
+    if STATE_FILE.exists() or not LEGACY_STATE_FILE.exists():
+        return
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(LEGACY_STATE_FILE, STATE_FILE)
+        logger.info("Migrated state file from %s to %s", LEGACY_STATE_FILE, STATE_FILE)
+    except Exception:
+        logger.warning(
+            "Failed to migrate legacy state file from %s to %s",
+            LEGACY_STATE_FILE,
+            STATE_FILE,
+            exc_info=True,
+        )
+
+
+# --------------------------------------------------------------------------------------
 # Event sinks
 # --------------------------------------------------------------------------------------
 
 
 class EventSink(Protocol):
-    def ensure_bucket(self, device_id: DeviceId) -> str: ...
-    def emit(self, bucket: str, events: Sequence[Event]) -> int: ...
+    def ensure_bucket(self, device_id: DeviceId) -> str:
+        ...
+
+    def emit(self, bucket: str, events: Sequence[Event]) -> int:
+        ...
 
 
 class ActivityWatchSink:
@@ -265,6 +590,7 @@ def tail_device_files(device_id: DeviceId, *, limit: int) -> list[Path]:
 
 def load_watermarks() -> Watermarks:
     """Load last seen cf_absolute_time per device from STATE_FILE."""
+    _migrate_legacy_state_file()
     try:
         with STATE_FILE.open("r") as f:
             data = json.load(f)
@@ -610,24 +936,62 @@ def _version_callback(v: Optional[bool]):
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 events_app = typer.Typer(no_args_is_help=True)
+config_app = typer.Typer(no_args_is_help=True)
 app.add_typer(events_app, name="events")
+app.add_typer(config_app, name="config")
 
 
 @app.callback()
 def global_opts(
     ctx: typer.Context,
-    log_level: str = typer.Option(
-        "INFO", "--log-level", help="ERROR | WARNING | INFO | DEBUG"
+    log_level: Optional[str] = typer.Option(
+        None, "--log-level", help="ERROR | WARNING | INFO | DEBUG"
     ),
-    tz: str = typer.Option("local", "--tz", help="Timestamp timezone (local or utc)"),
+    tz: Optional[str] = typer.Option(
+        None, "--tz", help="Timestamp timezone (local or utc)"
+    ),
+    config: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        help="Path to aw-import-screentime TOML config file",
+    ),
     version: Optional[bool] = typer.Option(
         None, "--version", callback=_version_callback, is_eager=True
     ),
 ) -> None:
     """Initialize logging and shared context."""
-    init_logging(log_level)
-    tzinfo = UTC if tz.lower() == "utc" else (datetime.now().astimezone().tzinfo or UTC)
-    ctx.obj = {"ctx": Ctx(tzinfo, getattr(logging, log_level.upper(), logging.INFO))}
+    config_path = resolve_config_path(config)
+    config_error: Optional[str] = None
+    try:
+        app_config = load_app_config(config_path)
+    except ConfigError as exc:
+        config_error = str(exc)
+        app_config = AppConfig(path=config_path, exists=config_path.exists())
+        if ctx.invoked_subcommand != "config":
+            raise typer.BadParameter(config_error, param_hint="--config") from exc
+
+    try:
+        level_name = normalize_log_level_name(
+            log_level or app_config.runtime.log_level or "INFO"
+        )
+    except ConfigError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--log-level") from exc
+    init_logging(level_name)
+
+    try:
+        tz_name = normalize_tz_name(tz or app_config.runtime.tz or "local")
+    except ConfigError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--tz") from exc
+    tzinfo = UTC if tz_name == "utc" else (datetime.now().astimezone().tzinfo or UTC)
+    ctx.obj = {
+        "ctx": Ctx(
+            tzinfo,
+            getattr(logging, level_name, logging.INFO),
+            app_config,
+            config_path,
+            config_error,
+        )
+    }
 
 
 @app.command("devices")
@@ -641,6 +1005,113 @@ def cmd_devices(
             {"device_id": d, **({"path": str(STREAMS_DIR / d)} if paths else {})}
             for d in get_device_ids(SYNC_DB_PATH, platform=platform)
         ]
+    )
+
+
+@config_app.command("show")
+def cmd_config_show(
+    ctx: typer.Context,
+    path: Optional[Path] = typer.Option(
+        None,
+        "--path",
+        help="Config path override (default: global --config or builtin path)",
+    ),
+) -> None:
+    """Show parsed aw-import-screentime configuration and effective defaults."""
+    target_path = resolve_config_path(path or ctx.obj["ctx"].config_path)
+    try:
+        config = load_app_config(target_path)
+    except ConfigError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--path") from exc
+
+    print_json(
+        data={
+            "config_path": str(target_path),
+            "exists": config.exists,
+            "config": config_to_dict(config),
+            "effective_defaults": {
+                "watch": {
+                    "device": list(config.watch.device),
+                    "storefront": resolve_storefront_inputs(
+                        None, config.watch.storefront
+                    ),
+                },
+                "activitywatch": {
+                    "testing": resolve_testing_flag(None, config),
+                    "port": resolve_aw_port(None, config),
+                    "bucket_suffix": resolve_bucket_suffix(None, config),
+                },
+                "runtime": {
+                    "log_level": config.runtime.log_level or "INFO",
+                    "tz": config.runtime.tz or "local",
+                    "retry_delay_seconds": (
+                        config.runtime.retry_delay_seconds
+                        if config.runtime.retry_delay_seconds is not None
+                        else RETRY_DELAY_SECONDS
+                    ),
+                },
+            },
+        }
+    )
+
+
+@config_app.command("validate")
+def cmd_config_validate(
+    ctx: typer.Context,
+    path: Optional[Path] = typer.Option(
+        None,
+        "--path",
+        help="Config path override (default: global --config or builtin path)",
+    ),
+) -> None:
+    """Validate configuration file syntax and values."""
+    target_path = resolve_config_path(path or ctx.obj["ctx"].config_path)
+    try:
+        config = load_app_config(target_path)
+    except ConfigError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--path") from exc
+    print_json(
+        data={
+            "valid": True,
+            "config_path": str(target_path),
+            "exists": config.exists,
+        }
+    )
+
+
+@config_app.command("init")
+def cmd_config_init(
+    ctx: typer.Context,
+    path: Optional[Path] = typer.Option(
+        None,
+        "--path",
+        help="Config path override (default: global --config or builtin path)",
+    ),
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Overwrite existing config file"
+    ),
+) -> None:
+    """Create a starter aw-import-screentime TOML configuration file."""
+    target_path = resolve_config_path(path or ctx.obj["ctx"].config_path)
+    existed_before = target_path.exists()
+    if existed_before and not overwrite:
+        print_json(
+            data={
+                "config_path": str(target_path),
+                "created": False,
+                "reason": "exists",
+            }
+        )
+        raise typer.Exit(1)
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(render_default_config(), encoding="utf-8")
+    print_json(
+        data={
+            "config_path": str(target_path),
+            "created": True,
+            "overwritten": overwrite and existed_before,
+        }
     )
 
 
@@ -667,14 +1138,18 @@ def cmd_events_preview(
     """
     Preview stitched events for selected devices (read-only).
     """
-    tzinfo: dt_tzinfo = ctx.obj["ctx"].tzinfo
+    runtime_ctx: Ctx = ctx.obj["ctx"]
+    config = runtime_ctx.config
+    tzinfo: dt_tzinfo = runtime_ctx.tzinfo
     since_dt = parse_since(since, tzinfo=tzinfo)
-    storefronts = resolve_storefronts(storefront)
+    storefronts = resolve_storefront_inputs(storefront, config.watch.storefront)
+    selected_devices = resolve_device_filter(device, config.watch.device)
+    selected_set = set(selected_devices) if selected_devices else None
 
     chosen = [
         d
         for d in get_device_ids(SYNC_DB_PATH, platform=platform)
-        if not device or d in set(device)
+        if selected_set is None or d in selected_set
     ]
 
     results = []
@@ -725,8 +1200,8 @@ def cmd_events_import(
     bucket_suffix: Optional[str] = typer.Option(
         None, "--bucket-suffix", help="Append suffix to ActivityWatch bucket IDs"
     ),
-    testing: bool = typer.Option(
-        False,
+    testing: Optional[bool] = typer.Option(
+        None,
         "--testing/--no-testing",
         help="Connect to aw-server testing instance (port 5666)",
     ),
@@ -739,28 +1214,35 @@ def cmd_events_import(
     """
     Import stitched events into ActivityWatch.
     """
-    tzinfo: dt_tzinfo = ctx.obj["ctx"].tzinfo
+    runtime_ctx: Ctx = ctx.obj["ctx"]
+    config = runtime_ctx.config
+    tzinfo: dt_tzinfo = runtime_ctx.tzinfo
     since_dt = parse_since(since, tzinfo=tzinfo)
-    storefronts = resolve_storefronts(storefront)
+    storefronts = resolve_storefront_inputs(storefront, config.watch.storefront)
+    selected_devices = resolve_device_filter(device, config.watch.device)
+    selected_set = set(selected_devices) if selected_devices else None
+    effective_testing = resolve_testing_flag(testing, config)
+    effective_port = resolve_aw_port(port, config)
+    effective_bucket_suffix = resolve_bucket_suffix(bucket_suffix, config)
 
     # ActivityWatch client
     client_kwargs: dict[str, object] = {"client_name": "aw-import-screentime"}
-    if testing:
+    if effective_testing:
         client_kwargs["testing"] = True
-    if port is not None:
-        client_kwargs["port"] = port
+    if effective_port is not None:
+        client_kwargs["port"] = effective_port
     try:
         client = ActivityWatchClient(**client_kwargs)  # type: ignore[arg-type]
         logger.info("ActivityWatch client initialized")
     except TypeError as exc:
         raise typer.BadParameter(f"ActivityWatchClient init failed: {exc}") from exc
 
-    sink: EventSink = ActivityWatchSink(client, bucket_suffix=bucket_suffix)
+    sink: EventSink = ActivityWatchSink(client, bucket_suffix=effective_bucket_suffix)
 
     chosen = [
         d
         for d in get_device_ids(SYNC_DB_PATH, platform=platform)
-        if not device or d in set(device)
+        if selected_set is None or d in selected_set
     ]
 
     summaries = []
@@ -814,9 +1296,11 @@ def cmd_file(
     """
     Inspect a single SEGB file (raw protobufs or stitched intervals).
     """
-    tzinfo: dt_tzinfo = ctx.obj["ctx"].tzinfo
+    runtime_ctx: Ctx = ctx.obj["ctx"]
+    config = runtime_ctx.config
+    tzinfo: dt_tzinfo = runtime_ctx.tzinfo
     since_dt = parse_since(since, tzinfo=tzinfo)
-    storefronts = resolve_storefronts(storefront)
+    storefronts = resolve_storefront_inputs(storefront, config.watch.storefront)
 
     if raw:
         results: list[RawEventItem] = []
@@ -873,7 +1357,7 @@ RETRY_DELAY_SECONDS = 5.0
 def cmd_watch(
     ctx: typer.Context,
     device: Optional[list[str]] = typer.Option(None, "--device", "-d"),
-    testing: bool = typer.Option(False, "--testing/--no-testing"),
+    testing: Optional[bool] = typer.Option(None, "--testing/--no-testing"),
     port: Optional[int] = typer.Option(None, "--port"),
     storefront: Optional[list[str]] = typer.Option(None, "--storefront"),
 ):
@@ -884,19 +1368,32 @@ def cmd_watch(
     - Stitches them into historical ActivityWatch interval events with true timestamps.
     - Inserts events via insert_events (no heartbeats).
     """
-    tzinfo: dt_tzinfo = ctx.obj["ctx"].tzinfo
-    storefronts = resolve_storefronts(storefront)
+    runtime_ctx: Ctx = ctx.obj["ctx"]
+    config = runtime_ctx.config
+    tzinfo: dt_tzinfo = runtime_ctx.tzinfo
+    storefronts = resolve_storefront_inputs(storefront, config.watch.storefront)
+    selected_devices = resolve_device_filter(device, config.watch.device)
+    selected_set = set(selected_devices) if selected_devices else None
+    effective_testing = resolve_testing_flag(testing, config)
+    effective_port = resolve_aw_port(port, config)
+    retry_delay_seconds = (
+        config.runtime.retry_delay_seconds
+        if config.runtime.retry_delay_seconds is not None
+        else RETRY_DELAY_SECONDS
+    )
 
     # init AW client (explicit args to satisfy type checker)
-    if port is None:
-        client = ActivityWatchClient("aw-watcher-screentime", testing=testing)
+    if effective_port is None:
+        client = ActivityWatchClient("aw-watcher-screentime", testing=effective_testing)
     else:
         client = ActivityWatchClient(
-            "aw-watcher-screentime", testing=testing, port=port
+            "aw-watcher-screentime", testing=effective_testing, port=effective_port
         )
 
     all_ids = get_device_ids(SYNC_DB_PATH, platform=2)
-    ids = list(all_ids if not device else (d for d in all_ids if d in set(device)))
+    ids = list(
+        all_ids if selected_set is None else (d for d in all_ids if d in selected_set)
+    )
 
     wake = threading.Event()
     changed_lock = threading.Lock()
@@ -904,8 +1401,9 @@ def cmd_watch(
     retry_lock = threading.Lock()
     scheduled_retries: set[str] = set()
 
-    def schedule_retry(dev: DeviceId, *, delay: float = RETRY_DELAY_SECONDS) -> None:
-        if delay <= 0:
+    def schedule_retry(dev: DeviceId, *, delay: Optional[float] = None) -> None:
+        actual_delay = retry_delay_seconds if delay is None else delay
+        if actual_delay <= 0:
             logger.debug("[%s] scheduling immediate retry", dev)
             with changed_lock:
                 changed.add(dev)
@@ -916,7 +1414,7 @@ def cmd_watch(
             if dev in scheduled_retries:
                 return
             scheduled_retries.add(dev)
-        logger.debug("[%s] scheduling retry in %.1fs", dev, delay)
+        logger.debug("[%s] scheduling retry in %.1fs", dev, actual_delay)
 
         def _enqueue() -> None:
             with changed_lock:
@@ -926,7 +1424,7 @@ def cmd_watch(
                 scheduled_retries.discard(dev)
             logger.debug("[%s] retry wake triggered", dev)
 
-        timer = threading.Timer(delay, _enqueue)
+        timer = threading.Timer(actual_delay, _enqueue)
         timer.daemon = True
         timer.start()
 
@@ -972,10 +1470,11 @@ def cmd_watch(
         raise typer.Exit(1)
 
     logger.info(
-        "Watcher starting: devices=%s testing=%s port=%s",
+        "Watcher starting: devices=%s testing=%s port=%s retry_delay=%.1fs",
         ids,
-        testing,
-        port,
+        effective_testing,
+        effective_port,
+        retry_delay_seconds,
     )
 
     # Consolidated per-device runtime objects
