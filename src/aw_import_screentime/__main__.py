@@ -971,7 +971,7 @@ def lookup_app_title(
 
 
 def enrich_events_with_titles(
-    events: Iterable[Event],
+    events: Sequence[Event],
     *,
     storefronts: Storefronts,
 ) -> None:
@@ -1752,7 +1752,7 @@ def cmd_watch(
 
     logger.debug("state init: runtimes=%s", runtimes)
 
-    sink = ActivityWatchSink(client, bucket_suffix=None)
+    sink = ActivityWatchSink(client, bucket_suffix=resolve_bucket_suffix(None, config))
     for dev in ids:
         runtimes[dev].bucket_id = sink.ensure_bucket(dev)
 
